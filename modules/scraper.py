@@ -58,19 +58,17 @@ async def save_otp_history(history):
         with open(OTP_HISTORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(history, f, indent=4)
 
-async def check_and_save_otp(number, otp, message_id):
+async def check_and_save_otp(number, otp, message_id, full_message):
     history = await load_otp_history()
     current_time = datetime.now().isoformat()
-    if number not in history:
-        history[number] = [{"otp": otp, "message_id": message_id, "timestamp": current_time}]
+    if message_id not in history:
+        history[message_id] = [{"otp": otp, "message_id": message_id, "timestamp": current_time, "full_message": full_message}]
         await save_otp_history(history)
         return True
-    for entry in history[number]:
-        if entry["otp"] == otp and entry["message_id"] != message_id:
-            entry_time = datetime.fromisoformat(entry["timestamp"])
-            if (datetime.now() - entry_time).total_seconds() < 60:
-                return False
-    history[number].append({"otp": otp, "message_id": message_id, "timestamp": current_time})
+    for entry in history[message_id]:
+        if entry["full_message"] == full_message and (datetime.now() - datetime.fromisoformat(entry["timestamp"])).total_seconds() < 60:
+            return False
+    history[message_id].append({"otp": otp, "message_id": message_id, "timestamp": current_time, "full_message": full_message})
     await save_otp_history(history)
     return True
 
@@ -440,7 +438,7 @@ def setup_otp_handler(app: TelegramClient):
                                 tasks = []
                                 for sms in batch:
                                     if sms['full_message'] != "No message found" and sms['otp'] != "No OTP found":
-                                        if await check_and_save_otp(sms['number'], sms['otp'], sms['message_id']):
+                                        if await check_and_save_otp(sms['number'], sms['otp'], sms['message_id'], sms['full_message']):
                                             LOGGER.info(f"Sending OTP for {sms['number']}: {sms['otp']}")
                                             tasks.append(send_sms_to_telegram(app, sms))
                                 await asyncio.gather(*tasks, return_exceptions=True)
