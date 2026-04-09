@@ -1,7 +1,6 @@
 import asyncio
 import json
 import re
-import ssl
 import time
 import os
 from datetime import datetime
@@ -10,6 +9,7 @@ import aiohttp
 import pycountry
 import brotli
 from bs4 import BeautifulSoup
+from curl_cffi.aio import AsyncCurl, CurlOpt
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, PeerIdInvalidError, ChatWriteForbiddenError
 from telethon.tl.types import ReplyInlineMarkup, KeyboardButtonRow, InputKeyboardButtonUserProfile, KeyboardButtonCopy
@@ -18,7 +18,6 @@ from telethon.utils import get_display_name
 from utils import LOGGER, SERVICE_PATTERNS, COUNTRY_ALIASES, LOGIN_URL, SMS_LIST_URL, SMS_NUMBERS_URL, SMS_DETAILS_URL, SMS_HEADERS, OTP_HISTORY_FILE, SMS_CACHE_FILE
 from config import EMAIL, PASSWORD, CHAT_IDS, OWNER_ID, UPDATE_CHANNEL_URL
 
-ssl._create_default_https_context = ssl._create_unverified_context
 file_lock = asyncio.Lock()
 
 def get_flag_emoji(country_code):
@@ -75,76 +74,132 @@ async def check_and_save_otp(number, otp, message_id, full_message):
 def format_otp_with_spaces(otp):
     return otp
 
-async def get_csrf_token(session):
+async def get_csrf_token_curl():
     try:
-        async with session.get(LOGIN_URL, timeout=10) as response:
-            response.raise_for_status()
-            text = await response.text()
-            soup = BeautifulSoup(text, 'html.parser')
-            csrf_input = soup.find('input', {'name': '_token'})
-            if csrf_input is None:
-                return None
-            csrf_token = csrf_input.get('value')
-            if not csrf_token:
-                return None
-            return csrf_token
+        curl = AsyncCurl()
+        curl.setopt(CurlOpt.URL, LOGIN_URL.encode())
+        curl.setopt(CurlOpt.TIMEOUT, 30)
+        curl.setopt(CurlOpt.FOLLOWLOCATION, True)
+        curl.setopt(CurlOpt.SSL_VERIFYPEER, False)
+        curl.setopt(CurlOpt.SSL_VERIFYHOST, False)
+        
+        buffer_output = []
+        curl.setopt(CurlOpt.WRITEFUNCTION, lambda data: buffer_output.append(data))
+        
+        await curl.perform()
+        
+        response_text = b''.join(buffer_output).decode('utf-8', errors='replace')
+        curl.close()
+        
+        soup = BeautifulSoup(response_text, 'html.parser')
+        csrf_input = soup.find('input', {'name': '_token'})
+        if csrf_input is None:
+            return None
+        csrf_token = csrf_input.get('value')
+        return csrf_token if csrf_token else None
     except Exception as e:
         LOGGER.error(f"Error getting CSRF token: {e}")
         return None
 
-async def login(session, attempt=1):
+async def login_curl(attempt=1):
     if attempt > 3:
         return False
     try:
-        csrf_token = await get_csrf_token(session)
+        csrf_token = await get_csrf_token_curl()
         if not csrf_token:
             await asyncio.sleep(10)
-            return await login(session, attempt + 1)
-        login_data = {
-            "_token": csrf_token,
-            "email": EMAIL,
-            "password": PASSWORD
-        }
-        async with session.post(LOGIN_URL, data=login_data, timeout=30) as login_response:
-            login_response.raise_for_status()
-            if "dashboard" in str(login_response.url) or login_response.status == 200:
-                return True
-            await asyncio.sleep(10)
-            return await login(session, attempt + 1)
+            return await login_curl(attempt + 1)
+        
+        login_data = f"_token={csrf_token}&email={EMAIL}&password={PASSWORD}"
+        
+        curl = AsyncCurl()
+        curl.setopt(CurlOpt.URL, LOGIN_URL.encode())
+        curl.setopt(CurlOpt.POST, True)
+        curl.setopt(CurlOpt.POSTFIELDS, login_data.encode())
+        curl.setopt(CurlOpt.TIMEOUT, 30)
+        curl.setopt(CurlOpt.FOLLOWLOCATION, True)
+        curl.setopt(CurlOpt.SSL_VERIFYPEER, False)
+        curl.setopt(CurlOpt.SSL_VERIFYHOST, False)
+        curl.setopt(CurlOpt.CUSTOMREQUEST, b"POST")
+        
+        for header_key, header_value in SMS_HEADERS.items():
+            curl.setopt(CurlOpt.HTTPHEADER, [f"{header_key}: {header_value}".encode()])
+        
+        buffer_output = []
+        curl.setopt(CurlOpt.WRITEFUNCTION, lambda data: buffer_output.append(data))
+        
+        await curl.perform()
+        response_code = curl.getinfo(3)
+        curl.close()
+        
+        if response_code == 200 or response_code == 302:
+            return True
+        
+        await asyncio.sleep(10)
+        return await login_curl(attempt + 1)
     except Exception as e:
         LOGGER.error(f"Login error: {e}")
         await asyncio.sleep(10)
-        return await login(session, attempt + 1)
+        return await login_curl(attempt + 1)
 
-async def refresh_session(session, last_login_time):
-    current_time = time.time()
-    if current_time - last_login_time >= 1800:
-        if await login(session):
-            return True, current_time
-        return False, last_login_time
-    return True, last_login_time
+async def fetch_with_curl(url, csrf_token, payload_str, max_retries=3):
+    delay = 5
+    for attempt in range(max_retries):
+        try:
+            curl = AsyncCurl()
+            curl.setopt(CurlOpt.URL, url.encode())
+            curl.setopt(CurlOpt.POST, True)
+            curl.setopt(CurlOpt.POSTFIELDS, payload_str.encode())
+            curl.setopt(CurlOpt.TIMEOUT, 30)
+            curl.setopt(CurlOpt.FOLLOWLOCATION, True)
+            curl.setopt(CurlOpt.SSL_VERIFYPEER, False)
+            curl.setopt(CurlOpt.SSL_VERIFYHOST, False)
+            curl.setopt(CurlOpt.ACCEPT_ENCODING, b"")
+            
+            headers_list = [f"{k}: {v}".encode() for k, v in SMS_HEADERS.items()]
+            headers_list.append(f"X-CSRF-TOKEN: {csrf_token}".encode())
+            curl.setopt(CurlOpt.HTTPHEADER, headers_list)
+            
+            buffer_output = []
+            curl.setopt(CurlOpt.WRITEFUNCTION, lambda data: buffer_output.append(data))
+            
+            await curl.perform()
+            response_code = curl.getinfo(3)
+            curl.close()
+            
+            if response_code == 429:
+                LOGGER.warning(f"Too Many Requests (429) on attempt {attempt + 1}, retrying in {delay} seconds")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            
+            response_bytes = b''.join(buffer_output)
+            response_text = response_bytes.decode('utf-8', errors='replace')
+            
+            return response_text
+        except Exception as e:
+            LOGGER.error(f"Error fetching data: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+            continue
+    
+    return None
 
-async def fetch_sms(session):
+async def fetch_sms(csrf_token):
     try:
-        csrf_token = await get_csrf_token(session)
         if not csrf_token:
-            if await login(session):
-                csrf_token = await get_csrf_token(session)
+            if not await login_curl():
+                return []
+            csrf_token = await get_csrf_token_curl()
             if not csrf_token:
                 return []
         
-        headers = SMS_HEADERS.copy()
-        headers["X-CSRF-TOKEN"] = csrf_token
         payload = f"_token={csrf_token}&from=&to="
+        response_text = await fetch_with_curl(SMS_LIST_URL, csrf_token, payload)
         
-        async with session.post(SMS_LIST_URL, headers=headers, data=payload, timeout=30) as response:
-            response.raise_for_status()
-            content_encoding = response.headers.get('Content-Encoding', '')
-            if content_encoding == 'br' and brotli:
-                content = await response.read()
-                response_text = brotli.decompress(content).decode('utf-8')
-            else:
-                response_text = await response.text()
+        if not response_text:
+            return []
         
         soup = BeautifulSoup(response_text, 'html.parser')
         items = soup.find_all('div', class_='item')
@@ -158,11 +213,11 @@ async def fetch_sms(session):
                 count = item.find('p', string=re.compile(r'^\d+$'))
                 count = count.text if count else "0"
                 
-                numbers = await fetch_numbers(session, range_name, csrf_token)
+                numbers = await fetch_numbers(csrf_token, range_name)
                 
                 for num in numbers:
                     try:
-                        sms_details = await fetch_sms_details(session, num, range_name, csrf_token)
+                        sms_details = await fetch_sms_details(csrf_token, num, range_name)
                         message_id = f"{num}_{sms_details.get('message', '')[:50]}"
                         if message_id in sms_cache:
                             continue
@@ -195,72 +250,49 @@ async def fetch_sms(session):
         LOGGER.error(f"Error in fetch_sms: {e}")
         return []
 
-async def fetch_numbers(session, range_name, csrf_token):
+async def fetch_numbers(csrf_token, range_name):
     try:
-        headers = SMS_HEADERS.copy()
-        headers["X-CSRF-TOKEN"] = csrf_token
         payload = f"_token={csrf_token}&start=&end=&range={range_name}"
-        async with session.post(SMS_NUMBERS_URL, headers=headers, data=payload, timeout=30) as response:
-            response.raise_for_status()
-            content_encoding = response.headers.get('Content-Encoding', '')
-            if content_encoding == 'br' and brotli:
-                content = await response.read()
-                response_text = brotli.decompress(content).decode('utf-8')
-            else:
-                response_text = await response.text()
-            soup = BeautifulSoup(response_text, 'html.parser')
-            number_divs = soup.find_all('div', class_='col-sm-4')
-            return [div.text.strip() for div in number_divs if div.text.strip()]
+        response_text = await fetch_with_curl(SMS_NUMBERS_URL, csrf_token, payload)
+        
+        if not response_text:
+            return []
+        
+        soup = BeautifulSoup(response_text, 'html.parser')
+        number_divs = soup.find_all('div', class_='col-sm-4')
+        return [div.text.strip() for div in number_divs if div.text.strip()]
     except Exception as e:
         LOGGER.error(f"Error fetching numbers: {e}")
         return []
 
-async def fetch_sms_details(session, number, range_name, csrf_token):
-    max_retries = 3
-    delay = 5
-    for attempt in range(max_retries):
-        try:
-            headers = SMS_HEADERS.copy()
-            headers["X-CSRF-TOKEN"] = csrf_token
-            payload = f"_token={csrf_token}&start=&end=&Number={number}&Range={range_name}"
-            async with session.post(SMS_DETAILS_URL, headers=headers, data=payload, timeout=30) as response:
-                response.raise_for_status()
-                content_encoding = response.headers.get('Content-Encoding', '')
-                if content_encoding == 'br' and brotli:
-                    content = await response.read()
-                    response_text = brotli.decompress(content).decode('utf-8')
-                else:
-                    response_text = await response.text()
-                soup = BeautifulSoup(response_text, 'html.parser')
-                message_divs = soup.select('div.col-9.col-sm-6 p.mb-0.pb-0')
-                messages = [div.text.strip() for div in message_divs] if message_divs else ["No message found"]
-                service_div = soup.find('div', class_='col-sm-4')
-                service = service_div.text.strip().replace('CLI', '').strip() if service_div else "Unknown"
-                
-                sms_details = []
-                for message in messages:
-                    service_from_message = extract_service(message)
-                    if service_from_message != "Unknown":
-                        service = service_from_message
-                    sms_details.append({"message": message, "service": service})
-                
-                return sms_details[0] if sms_details else {"message": "No message found", "service": "Unknown"}
-        except aiohttp.ClientResponseError as e:
-            if e.status == 429:
-                LOGGER.warning(f"Too Many Requests (429) on attempt {attempt + 1} for {number}, retrying in {delay} seconds")
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 60)
-                continue
-            LOGGER.error(f"Error fetching SMS details for {number}: {e}")
+async def fetch_sms_details(csrf_token, number, range_name):
+    try:
+        payload = f"_token={csrf_token}&start=&end=&Number={number}&Range={range_name}"
+        response_text = await fetch_with_curl(SMS_DETAILS_URL, csrf_token, payload)
+        
+        if not response_text:
             return {"message": "No message found", "service": "Unknown"}
-        except Exception as e:
-            LOGGER.error(f"Error fetching SMS details for {number}: {e}")
-            return {"message": "No message found", "service": "Unknown"}
-    LOGGER.error(f"Failed to fetch SMS details for {number} after {max_retries} retries")
-    return {"message": "No message found", "service": "Unknown"}
+        
+        soup = BeautifulSoup(response_text, 'html.parser')
+        message_divs = soup.select('div.col-9.col-sm-6 p.mb-0.pb-0')
+        messages = [div.text.strip() for div in message_divs] if message_divs else ["No message found"]
+        service_div = soup.find('div', class_='col-sm-4')
+        service = service_div.text.strip().replace('CLI', '').strip() if service_div else "Unknown"
+        
+        sms_details = []
+        for message in messages:
+            service_from_message = extract_service(message)
+            if service_from_message != "Unknown":
+                service = service_from_message
+            sms_details.append({"message": message, "service": service})
+        
+        return sms_details[0] if sms_details else {"message": "No message found", "service": "Unknown"}
+    except Exception as e:
+        LOGGER.error(f"Error fetching SMS details for {number}: {e}")
+        return {"message": "No message found", "service": "Unknown"}
 
 def extract_country(range_name):
-    country = range_name.split()[0].capitalize() if range_name and len(range_name.split()) > 1 else "Unknown"
+    country = range_name.split()[0].capitalize() if range_name and len(range_name.split()) > 0 else "Unknown"
     return country
 
 def extract_service(message):
@@ -341,8 +373,6 @@ async def send_sms_to_telegram(client, sms):
             except Exception as e:
                 LOGGER.error(f"Error checking chat {chat_id}: {e}")
         await asyncio.gather(*tasks, return_exceptions=True)
-    except PeerIdInvalidError:
-        LOGGER.error(f"Chat not found: {CHAT_IDS}")
     except Exception as e:
         LOGGER.error(f"Error sending OTP message: {e}")
 
@@ -388,6 +418,7 @@ async def send_start_alert(client):
     except FloodWaitError as e:
         LOGGER.warning(f"Flood wait error: Waiting {e.seconds} seconds")
         await asyncio.sleep(e.seconds + 1)
+        recipients = CHAT_IDS + [OWNER_ID]
         tasks = []
         for chat_id in recipients:
             try:
@@ -411,46 +442,59 @@ async def send_start_alert(client):
             except Exception as e:
                 LOGGER.error(f"Error checking chat {chat_id}: {e}")
         await asyncio.gather(*tasks, return_exceptions=True)
-    except PeerIdInvalidError:
-        LOGGER.error(f"Chat not found: {recipients}")
     except Exception as e:
         LOGGER.error(f"Error sending start alert: {e}")
 
 def setup_otp_handler(app: TelegramClient):
     async def run_sms_monitor():
-        async with aiohttp.ClientSession() as session:
-            await send_start_alert(app)
-            last_login_time = time.time()
-            if await login(session):
-                LOGGER.info("Login successful, starting monitoring...")
-                while True:
-                    try:
-                        success, last_login_time = await refresh_session(session, last_login_time)
-                        if not success:
+        await send_start_alert(app)
+        last_login_time = time.time()
+        csrf_token = None
+        
+        if await login_curl():
+            LOGGER.info("Login successful, starting monitoring...")
+            csrf_token = await get_csrf_token_curl()
+            
+            while True:
+                try:
+                    current_time = time.time()
+                    if current_time - last_login_time >= 1800:
+                        if await login_curl():
+                            csrf_token = await get_csrf_token_curl()
+                            last_login_time = current_time
+                        else:
                             LOGGER.error("Session refresh failed, retrying...")
                             await asyncio.sleep(10)
                             continue
-                        sms_list = await fetch_sms(session)
-                        if sms_list:
-                            LOGGER.info(f"Found {len(sms_list)} new SMS messages")
-                            for i in range(0, len(sms_list), 20):
-                                batch = sms_list[i:i+20]
-                                tasks = []
-                                for sms in batch:
-                                    if sms['full_message'] != "No message found" and sms['otp'] != "No OTP found":
-                                        if await check_and_save_otp(sms['number'], sms['otp'], sms['message_id'], sms['full_message']):
-                                            LOGGER.info(f"Sending OTP for {sms['number']}: {sms['otp']}")
-                                            tasks.append(send_sms_to_telegram(app, sms))
-                                await asyncio.gather(*tasks, return_exceptions=True)
-                                if i + 20 < len(sms_list):
-                                    LOGGER.info("Processed batch, waiting 3 seconds...")
-                                    await asyncio.sleep(3)
-                        else:
-                            LOGGER.info("No new SMS messages found")
-                        await asyncio.sleep(5)
-                    except Exception as e:
-                        LOGGER.error(f"Error in main loop: {e}")
-                        await asyncio.sleep(10)
-            else:
-                LOGGER.error("Initial login failed")
+                    
+                    if not csrf_token:
+                        csrf_token = await get_csrf_token_curl()
+                        if not csrf_token:
+                            await asyncio.sleep(10)
+                            continue
+                    
+                    sms_list = await fetch_sms(csrf_token)
+                    if sms_list:
+                        LOGGER.info(f"Found {len(sms_list)} new SMS messages")
+                        for i in range(0, len(sms_list), 20):
+                            batch = sms_list[i:i+20]
+                            tasks = []
+                            for sms in batch:
+                                if sms['full_message'] != "No message found" and sms['otp'] != "No OTP found":
+                                    if await check_and_save_otp(sms['number'], sms['otp'], sms['message_id'], sms['full_message']):
+                                        LOGGER.info(f"Sending OTP for {sms['number']}: {sms['otp']}")
+                                        tasks.append(send_sms_to_telegram(app, sms))
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                            if i + 20 < len(sms_list):
+                                LOGGER.info("Processed batch, waiting 3 seconds...")
+                                await asyncio.sleep(3)
+                    else:
+                        LOGGER.info("No new SMS messages found")
+                    await asyncio.sleep(5)
+                except Exception as e:
+                    LOGGER.error(f"Error in main loop: {e}")
+                    await asyncio.sleep(10)
+        else:
+            LOGGER.error("Initial login failed")
+    
     app.loop.create_task(run_sms_monitor())
