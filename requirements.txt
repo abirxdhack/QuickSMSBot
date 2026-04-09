@@ -5,3 +5,4 @@ pycountry
 brotli
 cryptg 
 asyncio
+curl_cffi
